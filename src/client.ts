@@ -1,14 +1,67 @@
 /**
- * WireLog analytics client for Node.js.
- * Zero runtime dependencies — uses native fetch (Node 18+).
+ * WireLog analytics client for Node.js and browsers.
+ * Zero runtime dependencies — uses native fetch and Web Crypto.
+ *
+ * In browsers, automatically piggybacks on the wirelog.js script tag's
+ * localStorage identity (device_id, user_id) and manages session_id,
+ * so events from both SDKs share the same user identity.
  */
 
-import { randomUUID } from "node:crypto";
+// ---------------------------------------------------------------------------
+// Environment detection helpers
+// ---------------------------------------------------------------------------
+
+const isBrowser =
+  typeof window !== "undefined" && typeof document !== "undefined";
+
+const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 min, matches wirelog.js
+
+function uuid(): string {
+  // crypto.randomUUID() is available in modern browsers and Node 19+.
+  // Fall back to getRandomValues for broader compat (Node 18, older Safari).
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  // Fallback: v4 UUID via getRandomValues
+  const buf = new Uint8Array(16);
+  crypto.getRandomValues(buf);
+  buf[6] = (buf[6] & 0x0f) | 0x40; // version 4
+  buf[8] = (buf[8] & 0x3f) | 0x80; // variant 1
+  const hex = Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/** Generate a 24-char hex ID, matching wirelog.js format. */
+function hexId(): string {
+  const arr = new Uint8Array(12);
+  crypto.getRandomValues(arr);
+  return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Safe localStorage wrappers — never throw.
+// Keys match wirelog.js script tag: "wl_did" (device), "wl_uid" (user).
+function lsGet(key: "wl_did" | "wl_uid"): string | null {
+  if (!isBrowser) return null;
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function lsSet(key: "wl_did" | "wl_uid", value: string): void {
+  if (!isBrowser) return;
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* storage full or blocked — best-effort */
+  }
+}
 
 export interface WireLogConfig {
-  /** API key (pk_, sk_, or aat_). Falls back to WIRELOG_API_KEY env var. */
+  /** API key (pk_, sk_, or aat_). */
   apiKey?: string;
-  /** API base URL. Falls back to WIRELOG_HOST env var or https://api.wirelog.ai. */
+  /** API base URL. Defaults to https://api.wirelog.ai. */
   host?: string;
 }
 
@@ -64,31 +117,60 @@ export class WireLog {
   private apiKey: string;
   private host: string;
 
+  // Browser identity state — populated only when running in a browser.
+  private _deviceId: string | null = null;
+  private _sessionId: string | null = null;
+  private _lastActivity = 0;
+  private _userId: string | null = null;
+
   constructor(config: WireLogConfig = {}) {
-    this.apiKey =
-      config.apiKey ?? process.env.WIRELOG_API_KEY ?? "";
-    this.host = (
-      config.host ??
-      process.env.WIRELOG_HOST ??
-      "https://api.wirelog.ai"
-    ).replace(/\/$/, "");
+    this.apiKey = config.apiKey ?? "";
+    this.host = (config.host ?? "https://api.wirelog.ai").replace(/\/$/, "");
+
+    if (isBrowser) {
+      // Piggyback on wirelog.js localStorage keys if present.
+      this._deviceId = lsGet("wl_did");
+      if (!this._deviceId) {
+        this._deviceId = hexId();
+        lsSet("wl_did", this._deviceId);
+      }
+      this._userId = lsGet("wl_uid") || null;
+      this._sessionId = hexId();
+      this._lastActivity = Date.now();
+    }
   }
 
-  /** Track a single event. */
+  /** Current device ID (browser-only, null in Node). */
+  get deviceId(): string | null {
+    return this._deviceId;
+  }
+
+  /** Current user ID (browser-only, null in Node until identify). */
+  get userId(): string | null {
+    return this._userId;
+  }
+
+  /** Track a single event. In browsers, auto-injects device/session/user IDs. */
   async track(event: TrackEvent): Promise<TrackResult> {
     const body: TrackEvent = {
+      ...this.browserIdentity(),
       ...event,
-      insert_id: event.insert_id ?? randomUUID(),
+      insert_id: event.insert_id ?? uuid(),
       time: event.time ?? new Date().toISOString(),
     };
     return this.post("/track", body) as Promise<TrackResult>;
   }
 
-  /** Track multiple events in one request (up to 2000). */
-  async trackBatch(
-    events: TrackEvent[],
-  ): Promise<TrackResult> {
-    return this.post("/track", { events }) as Promise<TrackResult>;
+  /** Track multiple events in one request (up to 2000). In browsers, auto-injects identity per event. */
+  async trackBatch(events: TrackEvent[]): Promise<TrackResult> {
+    const identity = this.browserIdentity();
+    const enriched = events.map((e) => ({
+      ...identity,
+      ...e,
+      insert_id: e.insert_id ?? uuid(),
+      time: e.time ?? new Date().toISOString(),
+    }));
+    return this.post("/track", { events: enriched }) as Promise<TrackResult>;
   }
 
   /** Run a pipe DSL query. Returns Markdown (default), JSON, or CSV. */
@@ -101,9 +183,61 @@ export class WireLog {
     });
   }
 
-  /** Bind a device to a user and/or set profile properties. */
+  /**
+   * Bind a device to a user and/or set profile properties.
+   * In browsers, also persists user_id to localStorage so it's shared
+   * with the wirelog.js script tag and survives page reloads.
+   */
   async identify(params: IdentifyParams): Promise<IdentifyResult> {
-    return this.post("/identify", params) as Promise<IdentifyResult>;
+    if (isBrowser) {
+      this._userId = params.user_id;
+      lsSet("wl_uid", params.user_id);
+    }
+    const body: IdentifyParams = {
+      ...params,
+      device_id: params.device_id || this._deviceId || undefined,
+    };
+    return this.post("/identify", body) as Promise<IdentifyResult>;
+  }
+
+  /** Clear identity state. In browsers, generates a new device ID and clears user. */
+  reset(): void {
+    if (!isBrowser) return;
+    this._userId = null;
+    this._sessionId = null;
+    this._lastActivity = 0;
+    // Match wirelog.js reset behavior: new device, clear stored user.
+    lsSet("wl_did", "");
+    lsSet("wl_uid", "");
+    this._deviceId = hexId();
+    lsSet("wl_did", this._deviceId);
+  }
+
+  /**
+   * Returns identity fields to merge into events when running in a browser.
+   * In Node this returns an empty object so explicit caller values are used as-is.
+   */
+  private browserIdentity(): Partial<TrackEvent> {
+    if (!isBrowser) return {};
+
+    // Session rotation on inactivity, matching wirelog.js SESSION_TIMEOUT.
+    const now = Date.now();
+    if (!this._sessionId || now - this._lastActivity > SESSION_TIMEOUT) {
+      this._sessionId = hexId();
+    }
+    this._lastActivity = now;
+
+    // Re-read userId from localStorage in case wirelog.js updated it.
+    const storedUid = lsGet("wl_uid");
+    if (storedUid && storedUid !== this._userId) {
+      this._userId = storedUid;
+    }
+
+    return {
+      device_id: this._deviceId ?? undefined,
+      session_id: this._sessionId,
+      user_id: this._userId ?? undefined,
+    };
   }
 
   private async post(path: string, body: unknown): Promise<unknown> {

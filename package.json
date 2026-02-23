@@ -1,7 +1,7 @@
 {
   "name": "wirelog",
-  "version": "0.1.0",
-  "description": "WireLog analytics client for Node.js — zero runtime dependencies",
+  "version": "0.2.0",
+  "description": "WireLog analytics client for Node.js and browsers — zero runtime dependencies",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.cjs",
