@@ -3,6 +3,8 @@
  * Zero runtime dependencies — uses native fetch (Node 18+).
  */
 
+import { randomUUID } from "node:crypto";
+
 export interface WireLogConfig {
   /** API key (pk_, sk_, or aat_). Falls back to WIRELOG_API_KEY env var. */
   apiKey?: string;
@@ -76,7 +78,7 @@ export class WireLog {
   async track(event: TrackEvent): Promise<TrackResult> {
     const body: TrackEvent = {
       ...event,
-      insert_id: event.insert_id ?? crypto.randomUUID(),
+      insert_id: event.insert_id ?? randomUUID(),
       time: event.time ?? new Date().toISOString(),
     };
     return this.post("/track", body) as Promise<TrackResult>;
