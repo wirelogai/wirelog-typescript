@@ -34,7 +34,7 @@ In browsers, the client automatically manages `device_id`, `session_id`, and `us
 // React app — identity auto-injected into every track() call
 import { WireLog } from "wirelog";
 
-const wl = new WireLog({ apiKey: "pk_your_public_key", host: "https://your-wirelog.example.com" });
+const wl = new WireLog({ apiKey: "pk_your_public_key" });
 
 // No need to pass device_id/session_id — auto-populated from browser state
 await wl.track({ event_type: "checkout", event_properties: { amount: 42 } });
@@ -47,15 +47,6 @@ await wl.track({ event_type: "upgrade", event_properties: { to: "enterprise" } }
 ```
 
 If the `wirelog.js` script tag is also on the page, both SDKs read/write the same `wl_did` and `wl_uid` localStorage keys. Calling `identify()` from either SDK makes the user visible to both.
-
-## Configuration
-
-```typescript
-const wl = new WireLog({
-  apiKey: "sk_...",                     // required
-  host: "https://api.wirelog.ai",       // optional, defaults to api.wirelog.ai
-});
-```
 
 ## API
 
