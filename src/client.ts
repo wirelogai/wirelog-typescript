@@ -115,6 +115,7 @@ export class WireLogError extends Error {
 export class WireLog {
   private apiKey: string;
   private host: string;
+  private _initialized = false;
 
   // Browser identity state — populated only when running in a browser.
   private _deviceId: string | null = null;
@@ -125,6 +126,7 @@ export class WireLog {
   constructor(config: WireLogConfig = {}) {
     this.apiKey = config.apiKey ?? "";
     this.host = (config.host ?? "https://api.wirelog.ai").replace(/\/$/, "");
+    if (this.apiKey) this._initialized = true;
 
     if (isBrowser) {
       // Piggyback on wirelog.js localStorage keys if present.
@@ -147,6 +149,13 @@ export class WireLog {
   /** Current user ID (browser-only, null in Node until identify). */
   get userId(): string | null {
     return this._userId;
+  }
+
+  /** Initialize the client with config. Use with the singleton: `wl.init({ apiKey: "pk_..." })`. */
+  init(config: WireLogConfig): void {
+    if (config.apiKey) this.apiKey = config.apiKey;
+    if (config.host) this.host = config.host.replace(/\/$/, "");
+    this._initialized = true;
   }
 
   /** Track a single event. In browsers, auto-injects device/session/user IDs. */
@@ -240,6 +249,10 @@ export class WireLog {
   }
 
   private async post(path: string, body: unknown): Promise<unknown> {
+    if (!this._initialized) {
+      console.warn("wirelog: call wl.init({ apiKey }) before tracking events");
+      return {};
+    }
     const url = `${this.host}${path}`;
     const resp = await fetch(url, {
       method: "POST",
@@ -262,3 +275,6 @@ export class WireLog {
     return resp.text();
   }
 }
+
+/** Module-level singleton. Call `wl.init({ apiKey })` once, then use everywhere. */
+export const wl = new WireLog();

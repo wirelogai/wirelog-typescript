@@ -1,4 +1,5 @@
 export {
+  wl,
   WireLog,
   WireLogError,
   type WireLogConfig,

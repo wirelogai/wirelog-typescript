@@ -11,44 +11,40 @@ npm install wirelog
 ## Quick Start
 
 ```typescript
-import { WireLog } from "wirelog";
+import { wl } from "wirelog";
 
-const wl = new WireLog({ apiKey: "sk_your_secret_key" });
+wl.init({ apiKey: "pk_your_public_key" });
 
 // Track an event
-await wl.track({ event_type: "signup", user_id: "u_123", event_properties: { plan: "free" } });
-
-// Query analytics (returns Markdown by default)
-const result = await wl.query("signup | last 7d | count by day");
-console.log(result);
+wl.track({ event_type: "signup", user_id: "u_123", event_properties: { plan: "free" } });
 
 // Identify a user (bind device → user, set profile)
-await wl.identify({ user_id: "alice@acme.org", device_id: "dev_abc", user_properties: { plan: "pro" } });
-```
-
-## Browser Usage
-
-In browsers, the client automatically manages `device_id`, `session_id`, and `user_id` — matching the same localStorage keys as the `wirelog.js` script tag (`wl_did`, `wl_uid`). This means you can use both SDKs on the same page and identity is shared:
-
-```typescript
-// React app — identity auto-injected into every track() call
-import { WireLog } from "wirelog";
-
-const wl = new WireLog({ apiKey: "pk_your_public_key" });
-
-// No need to pass device_id/session_id — auto-populated from browser state
-await wl.track({ event_type: "checkout", event_properties: { amount: 42 } });
-
-// Identify once — persists to localStorage, shared with wirelog.js script tag
-await wl.identify({ user_id: "alice@acme.org", user_properties: { plan: "pro" } });
+wl.identify({ user_id: "alice@acme.org", user_properties: { plan: "pro" } });
 
 // All subsequent track() calls include user_id automatically
-await wl.track({ event_type: "upgrade", event_properties: { to: "enterprise" } });
+wl.track({ event_type: "checkout", event_properties: { amount: 42 } });
 ```
 
-If the `wirelog.js` script tag is also on the page, both SDKs read/write the same `wl_did` and `wl_uid` localStorage keys. Calling `identify()` from either SDK makes the user visible to both.
+In browsers, the singleton automatically manages `device_id`, `session_id`, and `user_id` — matching the same localStorage keys as the `wirelog.js` script tag (`wl_did`, `wl_uid`). If both SDKs are on the page, calling `identify()` from either one makes the user visible to both.
+
+## Explicit Instances
+
+For server-side Node.js, multiple projects, or test isolation, create instances directly:
+
+```typescript
+import { WireLog } from "wirelog";
+
+const client = new WireLog({ apiKey: "sk_your_secret_key" });
+
+await client.track({ event_type: "invoice.paid", user_id: "u_123" });
+const result = await client.query("invoice.paid | last 7d | count by day");
+```
 
 ## API
+
+### `wl.init(config)`
+
+Initialize the singleton with your API key. Call once at app startup. If you skip this, `track()`/`identify()`/`query()` will `console.warn` and no-op.
 
 ### `wl.track(event)`
 
