@@ -16,25 +16,28 @@ const isBrowser =
 
 const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 min, matches wirelog.js
 
+const _crypto: Crypto | undefined = globalThis.crypto;
+
 function uuid(): string {
-  const c = globalThis.crypto;
-  if (c && typeof c.randomUUID === "function") {
-    return c.randomUUID();
-  }
-  // Fallback: v4 UUID via getRandomValues (Node 18, older Safari).
-  const buf = new Uint8Array(16);
-  c.getRandomValues(buf);
-  buf[6] = (buf[6] & 0x0f) | 0x40; // version 4
-  buf[8] = (buf[8] & 0x3f) | 0x80; // variant 1
-  const hex = Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  if (_crypto?.randomUUID) return _crypto.randomUUID();
+  // Fallback for Node 18 where globalThis.crypto is undefined in ESM.
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+  });
 }
 
 /** Generate a 24-char hex ID, matching wirelog.js format. */
 function hexId(): string {
-  const arr = new Uint8Array(12);
-  globalThis.crypto.getRandomValues(arr);
-  return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
+  if (_crypto?.getRandomValues) {
+    const arr = new Uint8Array(12);
+    _crypto.getRandomValues(arr);
+    return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  // Fallback for Node 18.
+  let hex = "";
+  for (let i = 0; i < 24; i++) hex += Math.floor(Math.random() * 16).toString(16);
+  return hex;
 }
 
 // Safe localStorage wrappers — never throw.
