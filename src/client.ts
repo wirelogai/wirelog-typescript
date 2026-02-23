@@ -17,14 +17,13 @@ const isBrowser =
 const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 min, matches wirelog.js
 
 function uuid(): string {
-  // crypto.randomUUID() is available in modern browsers and Node 19+.
-  // Fall back to getRandomValues for broader compat (Node 18, older Safari).
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
+  const c = globalThis.crypto;
+  if (c && typeof c.randomUUID === "function") {
+    return c.randomUUID();
   }
-  // Fallback: v4 UUID via getRandomValues
+  // Fallback: v4 UUID via getRandomValues (Node 18, older Safari).
   const buf = new Uint8Array(16);
-  crypto.getRandomValues(buf);
+  c.getRandomValues(buf);
   buf[6] = (buf[6] & 0x0f) | 0x40; // version 4
   buf[8] = (buf[8] & 0x3f) | 0x80; // variant 1
   const hex = Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
@@ -34,7 +33,7 @@ function uuid(): string {
 /** Generate a 24-char hex ID, matching wirelog.js format. */
 function hexId(): string {
   const arr = new Uint8Array(12);
-  crypto.getRandomValues(arr);
+  globalThis.crypto.getRandomValues(arr);
   return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
