@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 export interface WireLogConfig {
   /** API key (pk_, sk_, or aat_). Falls back to WIRELOG_API_KEY env var. */
   apiKey?: string;
-  /** API base URL. Falls back to WIRELOG_HOST env var or https://wirelog.ai. */
+  /** API base URL. Falls back to WIRELOG_HOST env var or https://api.wirelog.ai. */
   host?: string;
 }
 
@@ -70,7 +70,7 @@ export class WireLog {
     this.host = (
       config.host ??
       process.env.WIRELOG_HOST ??
-      "https://wirelog.ai"
+      "https://api.wirelog.ai"
     ).replace(/\/$/, "");
   }
 

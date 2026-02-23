@@ -31,7 +31,7 @@ await wl.identify({ user_id: "alice@acme.org", device_id: "dev_abc", user_proper
 ```typescript
 const wl = new WireLog({
   apiKey: "sk_...",         // or set WIRELOG_API_KEY env var
-  host: "https://wirelog.ai", // or set WIRELOG_HOST env var
+  host: "https://api.wirelog.ai", // or set WIRELOG_HOST env var
 });
 ```
 

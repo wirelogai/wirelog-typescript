@@ -134,7 +134,7 @@ describe("WireLog client", () => {
     assert.equal(lastRequest?.headers["x-api-key"], "sk_test_key");
   });
 
-  it("defaults host to wirelog.ai", () => {
+  it("defaults host to api.wirelog.ai", () => {
     const wl = new WireLog({ apiKey: "sk_test" });
     // We can't easily test the private field, but we can test construction doesn't throw
     assert.ok(wl);
@@ -143,7 +143,7 @@ describe("WireLog client", () => {
   it("strips trailing slash from host", () => {
     const wl = new WireLog({
       apiKey: "sk_test",
-      host: "https://wirelog.ai/",
+      host: "https://api.wirelog.ai/",
     });
     assert.ok(wl);
   });
