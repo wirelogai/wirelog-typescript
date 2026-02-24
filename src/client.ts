@@ -616,10 +616,11 @@ export class WireLog {
   ): Record<string, unknown> | undefined {
     if (!isBrowserEnv()) return props;
 
+    const nav = typeof globalThis.navigator === "object" ? globalThis.navigator : undefined;
     const autoProps: Record<string, unknown> = {
       url: window.location.href,
     };
-    if (navigator.language) autoProps.language = navigator.language;
+    if (nav?.language) autoProps.language = nav.language;
     try {
       const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
       if (tz) autoProps.timezone = tz;
