@@ -27,6 +27,15 @@ wl.track({ event_type: "checkout", event_properties: { amount: 42 } });
 
 In browsers, the singleton automatically manages `device_id`, `session_id`, and `user_id` — matching the same localStorage keys as the `wirelog.js` script tag (`wl_did`, `wl_uid`). If both SDKs are on the page, calling `identify()` from either one makes the user visible to both.
 
+Browser `track()` and `trackBatch()` also auto-inject event context into `event_properties`:
+- `url`
+- `language`
+- `timezone`
+
+Browser events are also marked with `clientOriginated: true` automatically.
+
+Caller-provided `event_properties` win on key conflicts.
+
 ## Explicit Instances
 
 For server-side Node.js, multiple projects, or test isolation, create instances directly:
@@ -48,11 +57,11 @@ Initialize the singleton with your API key. Call once at app startup. If you ski
 
 ### `wl.track(event)`
 
-Track a single event. Auto-generates `insert_id` and `time` if not provided. In browsers, auto-injects `device_id`, `session_id`, and `user_id`.
+Track a single event. Auto-generates `insert_id` and `time` if not provided. In browsers, auto-injects `device_id`, `session_id`, `user_id`, and browser context (`url`, `language`, `timezone`).
 
 ### `wl.trackBatch(events)`
 
-Track multiple events in one request (up to 2000). In browsers, auto-injects identity per event.
+Track multiple events in one request (up to 2000). In browsers, auto-injects identity and browser context per event.
 
 ### `wl.query(q, opts?)`
 
@@ -61,6 +70,12 @@ Run a pipe DSL query. Options: `format` (`"llm"`, `"json"`, `"csv"`), `limit`, `
 ### `wl.identify(params)`
 
 Bind a device to a user and/or set profile properties. Supports `user_property_ops` (`$set`, `$set_once`, `$add`, `$unset`). In browsers, persists `user_id` to localStorage.
+
+`identify()` requires a non-empty `user_id`. In browser mode, pending URL attribution (`utm_*`, `gclid`, `fbclid`) is merged into one identify call:
+- first touch -> `$set_once.initial_*`
+- last touch -> `$set.last_*`
+
+Attribution dedupe is marked only after a successful identify response.
 
 ### `wl.reset()`
 

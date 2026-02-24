@@ -8,13 +8,28 @@
  */
 
 // ---------------------------------------------------------------------------
-// Environment detection helpers
+// Environment helpers
 // ---------------------------------------------------------------------------
 
-const isBrowser =
-  typeof window !== "undefined" && typeof document !== "undefined";
+function isBrowserEnv(): boolean {
+  return typeof window !== "undefined" && typeof document !== "undefined";
+}
 
 const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 min, matches wirelog.js
+
+const ATTR_PARAMS = [
+  "utm_source",
+  "utm_medium",
+  "utm_campaign",
+  "utm_term",
+  "utm_content",
+  "gclid",
+  "fbclid",
+] as const;
+
+const ATTR_FIRST_KEY = "wl_attr_first";
+const ATTR_LAST_KEY = "wl_attr_last";
+const ATTR_SYNC_USER_KEY = "wl_attr_sync_user";
 
 const _crypto: Crypto | undefined = globalThis.crypto;
 
@@ -40,10 +55,9 @@ function hexId(): string {
   return hex;
 }
 
-// Safe localStorage wrappers — never throw.
-// Keys match wirelog.js script tag: "wl_did" (device), "wl_uid" (user).
+// Safe storage wrappers — never throw.
 function lsGet(key: "wl_did" | "wl_uid"): string | null {
-  if (!isBrowser) return null;
+  if (!isBrowserEnv()) return null;
   try {
     return localStorage.getItem(key);
   } catch {
@@ -52,11 +66,98 @@ function lsGet(key: "wl_did" | "wl_uid"): string | null {
 }
 
 function lsSet(key: "wl_did" | "wl_uid", value: string): void {
-  if (!isBrowser) return;
+  if (!isBrowserEnv()) return;
   try {
     localStorage.setItem(key, value);
   } catch {
     /* storage full or blocked — best-effort */
+  }
+}
+
+function ssGet(key: string): string | null {
+  if (!isBrowserEnv()) return null;
+  try {
+    return sessionStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function ssSet(key: string, value: string): void {
+  if (!isBrowserEnv()) return;
+  try {
+    sessionStorage.setItem(key, value);
+  } catch {
+    /* best effort */
+  }
+}
+
+function ssRemove(key: string): void {
+  if (!isBrowserEnv()) return;
+  try {
+    sessionStorage.removeItem(key);
+  } catch {
+    /* best effort */
+  }
+}
+
+function readSessionJSON(key: string): Record<string, string> {
+  const raw = ssGet(key);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object") {
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof v === "string" && v !== "") out[k] = v;
+      }
+      return out;
+    }
+  } catch {
+    // ignore parse failure
+  }
+  return {};
+}
+
+function writeSessionJSON(key: string, value: Record<string, string>): void {
+  ssSet(key, JSON.stringify(value));
+}
+
+function hasOwnKeys(obj: Record<string, unknown>): boolean {
+  for (const k in obj) {
+    if (Object.prototype.hasOwnProperty.call(obj, k)) return true;
+  }
+  return false;
+}
+
+function cloneMap<T>(obj?: Record<string, T>): Record<string, T> {
+  if (!obj || typeof obj !== "object") return {};
+  return { ...obj };
+}
+
+function extractAttributionFromLocation(): Record<string, string> {
+  if (!isBrowserEnv()) return {};
+  const out: Record<string, string> = {};
+  try {
+    const params = new URLSearchParams(window.location.search || "");
+    for (const key of ATTR_PARAMS) {
+      const value = params.get(key);
+      if (value) out[key] = value;
+    }
+  } catch {
+    // URLSearchParams unsupported or blocked
+  }
+  return out;
+}
+
+function applyAttributionProps(
+  target: Record<string, unknown>,
+  prefix: string,
+  attrs: Record<string, string>,
+): void {
+  for (const key of ATTR_PARAMS) {
+    const value = attrs[key];
+    if (value) target[`${prefix}${key}`] = value;
   }
 }
 
@@ -72,6 +173,7 @@ export interface TrackEvent {
   user_id?: string;
   device_id?: string;
   session_id?: string;
+  clientOriginated?: boolean;
   time?: string;
   event_properties?: Record<string, unknown>;
   user_properties?: Record<string, unknown>;
@@ -126,12 +228,15 @@ export class WireLog {
   private _lastActivity = 0;
   private _userId: string | null = null;
 
+  // Tracks the user_id for which attribution has already been merged.
+  private _attrIdentified: string | null = null;
+
   constructor(config: WireLogConfig = {}) {
     this.apiKey = config.apiKey ?? "";
     this.host = (config.host ?? "https://api.wirelog.ai").replace(/\/$/, "");
     if (this.apiKey) this._initialized = true;
 
-    if (isBrowser) {
+    if (isBrowserEnv()) {
       // Piggyback on wirelog.js localStorage keys if present.
       this._deviceId = lsGet("wl_did");
       if (!this._deviceId) {
@@ -141,6 +246,10 @@ export class WireLog {
       this._userId = lsGet("wl_uid") || null;
       this._sessionId = hexId();
       this._lastActivity = Date.now();
+      this._attrIdentified = ssGet(ATTR_SYNC_USER_KEY) || null;
+
+      // Keep attribution pending state up to date even before identify.
+      this.captureAttribution();
     }
   }
 
@@ -161,27 +270,17 @@ export class WireLog {
     this._initialized = true;
   }
 
-  /** Track a single event. In browsers, auto-injects device/session/user IDs. */
+  /** Track a single event. In browsers, auto-injects identity + context. */
   async track(event: TrackEvent): Promise<TrackResult> {
-    const body: TrackEvent = {
-      ...this.browserIdentity(),
-      ...event,
-      insert_id: event.insert_id ?? uuid(),
-      time: event.time ?? new Date().toISOString(),
-    };
+    const body = this.enrichEvent(event);
     return this.post("/track", body) as Promise<TrackResult>;
   }
 
-  /** Track multiple events in one request (up to 2000). In browsers, auto-injects identity per event. */
+  /** Track multiple events in one request (up to 2000). In browsers, auto-injects identity + context per event. */
   async trackBatch(events: TrackEvent[]): Promise<TrackResult> {
-    const identity = this.browserIdentity();
-    const enriched = events.map((e) => ({
-      ...identity,
-      ...e,
-      insert_id: e.insert_id ?? uuid(),
-      time: e.time ?? new Date().toISOString(),
-    }));
-    return this.post("/track", { events: enriched }) as Promise<TrackResult>;
+    const enriched = events.map((e) => this.enrichEvent(e));
+    const body = isBrowserEnv() ? { events: enriched, clientOriginated: true } : { events: enriched };
+    return this.post("/track", body) as Promise<TrackResult>;
   }
 
   /** Run a pipe DSL query. Returns Markdown (default), JSON, or CSV. */
@@ -200,28 +299,84 @@ export class WireLog {
    * with the wirelog.js script tag and survives page reloads.
    */
   async identify(params: IdentifyParams): Promise<IdentifyResult> {
-    if (isBrowser) {
-      this._userId = params.user_id;
-      lsSet("wl_uid", params.user_id);
+    const userID = (params.user_id || "").trim();
+    if (!userID) {
+      throw new Error("wirelog: identify requires non-empty user_id");
     }
+
+    let mergedOps = params.user_property_ops;
+    let shouldMarkAttrSynced = false;
+
+    if (isBrowserEnv()) {
+      this._userId = userID;
+      lsSet("wl_uid", userID);
+
+      const attrs = this.captureAttribution();
+      if (this._attrIdentified !== userID) {
+        const setOnce = cloneMap(mergedOps?.$set_once);
+        const set = cloneMap(mergedOps?.$set);
+
+        applyAttributionProps(setOnce, "initial_", attrs.first);
+        applyAttributionProps(set, "last_", attrs.last);
+
+        mergedOps = {
+          ...(mergedOps || {}),
+          ...(hasOwnKeys(setOnce) ? { $set_once: setOnce } : {}),
+          ...(hasOwnKeys(set) ? { $set: set } : {}),
+        };
+
+        shouldMarkAttrSynced = hasOwnKeys(attrs.first) || hasOwnKeys(attrs.last);
+      }
+    }
+
     const body: IdentifyParams = {
       ...params,
+      user_id: userID,
       device_id: params.device_id || this._deviceId || undefined,
+      user_property_ops: mergedOps,
     };
-    return this.post("/identify", body) as Promise<IdentifyResult>;
+
+    const result = (await this.post("/identify", body)) as IdentifyResult;
+
+    if (isBrowserEnv() && shouldMarkAttrSynced) {
+      this._attrIdentified = userID;
+      ssSet(ATTR_SYNC_USER_KEY, userID);
+    }
+
+    return result;
   }
 
   /** Clear identity state. In browsers, generates a new device ID and clears user. */
   reset(): void {
-    if (!isBrowser) return;
+    if (!isBrowserEnv()) return;
     this._userId = null;
     this._sessionId = null;
     this._lastActivity = 0;
+    this._attrIdentified = null;
+
     // Match wirelog.js reset behavior: new device, clear stored user.
     lsSet("wl_did", "");
     lsSet("wl_uid", "");
+    ssRemove(ATTR_SYNC_USER_KEY);
+    ssRemove(ATTR_FIRST_KEY);
+    ssRemove(ATTR_LAST_KEY);
+
     this._deviceId = hexId();
     lsSet("wl_did", this._deviceId);
+  }
+
+  private enrichEvent(event: TrackEvent): TrackEvent {
+    const identity = this.browserIdentity();
+    const props = this.mergeBrowserContext(event.event_properties);
+
+    return {
+      ...identity,
+      ...event,
+      event_properties: props,
+      insert_id: event.insert_id ?? uuid(),
+      time: event.time ?? new Date().toISOString(),
+      clientOriginated: isBrowserEnv() ? true : event.clientOriginated,
+    };
   }
 
   /**
@@ -229,7 +384,9 @@ export class WireLog {
    * In Node this returns an empty object so explicit caller values are used as-is.
    */
   private browserIdentity(): Partial<TrackEvent> {
-    if (!isBrowser) return {};
+    if (!isBrowserEnv()) return {};
+
+    this.captureAttribution();
 
     // Session rotation on inactivity, matching wirelog.js SESSION_TIMEOUT.
     const now = Date.now();
@@ -249,6 +406,47 @@ export class WireLog {
       session_id: this._sessionId,
       user_id: this._userId ?? undefined,
     };
+  }
+
+  private mergeBrowserContext(
+    props?: Record<string, unknown>,
+  ): Record<string, unknown> | undefined {
+    if (!isBrowserEnv()) return props;
+
+    const autoProps: Record<string, unknown> = {
+      url: window.location.href,
+    };
+    if (navigator.language) autoProps.language = navigator.language;
+    try {
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (tz) autoProps.timezone = tz;
+    } catch {
+      // Ignore Intl failures.
+    }
+
+    return {
+      ...autoProps,
+      ...(props || {}),
+    };
+  }
+
+  private captureAttribution(): { first: Record<string, string>; last: Record<string, string> } {
+    if (!isBrowserEnv()) return { first: {}, last: {} };
+
+    const current = extractAttributionFromLocation();
+    let first = readSessionJSON(ATTR_FIRST_KEY);
+    let last = readSessionJSON(ATTR_LAST_KEY);
+
+    if (hasOwnKeys(current)) {
+      if (!hasOwnKeys(first)) {
+        first = current;
+        writeSessionJSON(ATTR_FIRST_KEY, first);
+      }
+      last = current;
+      writeSessionJSON(ATTR_LAST_KEY, last);
+    }
+
+    return { first, last };
   }
 
   private async post(path: string, body: unknown): Promise<unknown> {
