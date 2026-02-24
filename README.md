@@ -27,7 +27,7 @@ wl.track({ event_type: "checkout", event_properties: { amount: 42 } });
 
 In browsers, the singleton automatically manages `device_id`, `session_id`, and `user_id` — matching the same localStorage keys as the `wirelog.js` script tag (`wl_did`, `wl_uid`). If both SDKs are on the page, calling `identify()` from either one makes the user visible to both.
 
-Browser `track()` and `trackBatch()` also auto-inject event context into `event_properties`:
+Browser `track()` and `trackBatch()` auto-inject event context into `event_properties`:
 - `url`
 - `language`
 - `timezone`
@@ -35,6 +35,16 @@ Browser `track()` and `trackBatch()` also auto-inject event context into `event_
 Browser events are also marked with `clientOriginated: true` automatically.
 
 Caller-provided `event_properties` win on key conflicts.
+
+## Browser Delivery (Breaking Change)
+
+In browsers, `track()` now buffers events locally and flushes them asynchronously in small batches:
+- Flushes on every 10 queued events or every 2 seconds
+- Retries transient failures (`429`, `5xx`, network) with backoff (up to 3 retries)
+- Flushes on `visibilitychange` (hidden) and `pagehide` using `fetch(..., { keepalive: true })`
+- Queue is capped at 500 events (oldest events are dropped first)
+
+`trackBatch()` is still explicit and sends immediately as one request (up to 2000 events).
 
 ## Explicit Instances
 
@@ -57,11 +67,22 @@ Initialize the singleton with your API key. Call once at app startup. If you ski
 
 ### `wl.track(event)`
 
-Track a single event. Auto-generates `insert_id` and `time` if not provided. In browsers, auto-injects `device_id`, `session_id`, `user_id`, and browser context (`url`, `language`, `timezone`).
+Track a single event. Auto-generates `insert_id` and `time` if not provided.
+
+In browsers, `track()` is buffered by default: it enqueues the event and returns `{ accepted: 1, buffered: true }`.
+
+In Node, `track()` sends immediately and returns the API response.
 
 ### `wl.trackBatch(events)`
 
-Track multiple events in one request (up to 2000). In browsers, auto-injects identity and browser context per event.
+Track multiple events in one request (up to 2000). In browsers, auto-injects identity and browser context per event, then sends immediately.
+
+### `wl.flush()`
+
+Flush buffered browser `track()` events immediately.
+
+- Browser: sends queued events now and returns `{ accepted: N }`
+- Node: no-op, returns `{ accepted: 0 }`
 
 ### `wl.query(q, opts?)`
 

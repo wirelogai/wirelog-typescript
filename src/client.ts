@@ -3,8 +3,8 @@
  * Zero runtime dependencies — uses native fetch and Web Crypto.
  *
  * In browsers, automatically piggybacks on the wirelog.js script tag's
- * localStorage identity (device_id, user_id) and manages session_id,
- * so events from both SDKs share the same user identity.
+ * localStorage identity (device_id, user_id), manages session_id, and
+ * buffers `track()` events with async batch flushes.
  */
 
 // ---------------------------------------------------------------------------
@@ -16,6 +16,11 @@ function isBrowserEnv(): boolean {
 }
 
 const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 min, matches wirelog.js
+const BATCH_INTERVAL = 2000; // 2s, matches wirelog.js
+const BATCH_MAX = 10;
+const QUEUE_MAX = 500;
+const RETRY_MAX = 3;
+const RETRY_BASE_MS = 1000;
 
 const ATTR_PARAMS = [
   "utm_source",
@@ -182,6 +187,8 @@ export interface TrackEvent {
 
 export interface TrackResult {
   accepted: number;
+  /** True when events were queued locally in the browser (not yet acknowledged by the API). */
+  buffered?: boolean;
 }
 
 export interface IdentifyParams {
@@ -205,6 +212,8 @@ export interface QueryOptions {
   limit?: number;
   offset?: number;
 }
+
+type FlushReason = "manual" | "batch" | "interval" | "retry" | "hidden" | "pagehide";
 
 /** Error thrown when the WireLog API returns a non-2xx response. */
 export class WireLogError extends Error {
@@ -230,6 +239,12 @@ export class WireLog {
 
   // Tracks the user_id for which attribution has already been merged.
   private _attrIdentified: string | null = null;
+  private _queue: TrackEvent[] = [];
+  private _flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private _retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private _retryCount = 0;
+  private _flushPromise: Promise<TrackResult> | null = null;
+  private _browserHooksInstalled = false;
 
   constructor(config: WireLogConfig = {}) {
     this.apiKey = config.apiKey ?? "";
@@ -250,6 +265,7 @@ export class WireLog {
 
       // Keep attribution pending state up to date even before identify.
       this.captureAttribution();
+      this.installBrowserFlushHooks();
     }
   }
 
@@ -270,17 +286,43 @@ export class WireLog {
     this._initialized = true;
   }
 
-  /** Track a single event. In browsers, auto-injects identity + context. */
+  /** Track a single event. In browsers, this is buffered and flushed in async batches. */
   async track(event: TrackEvent): Promise<TrackResult> {
     const body = this.enrichEvent(event);
-    return this.post("/track", body) as Promise<TrackResult>;
+    if (!isBrowserEnv()) {
+      return this.post("/track", body) as Promise<TrackResult>;
+    }
+    if (!this.ensureInitialized()) {
+      return { accepted: 0, buffered: true };
+    }
+
+    this.enqueueBrowserEvents([body]);
+    if (this._queue.length >= BATCH_MAX) {
+      void this.flushQueuedEvents("batch");
+    } else {
+      this.scheduleFlush();
+    }
+    return { accepted: 1, buffered: true };
   }
 
-  /** Track multiple events in one request (up to 2000). In browsers, auto-injects identity + context per event. */
+  /**
+   * Track multiple events in one request (up to 2000).
+   * In browsers, this sends immediately (explicit batch) and auto-injects identity/context per event.
+   */
   async trackBatch(events: TrackEvent[]): Promise<TrackResult> {
     const enriched = events.map((e) => this.enrichEvent(e));
     const body = isBrowserEnv() ? { events: enriched, clientOriginated: true } : { events: enriched };
     return this.post("/track", body) as Promise<TrackResult>;
+  }
+
+  /**
+   * Flush buffered browser events immediately.
+   * In Node this is a no-op and returns `{ accepted: 0 }`.
+   */
+  async flush(): Promise<TrackResult> {
+    if (!isBrowserEnv()) return { accepted: 0 };
+    if (!this.ensureInitialized()) return { accepted: 0, buffered: true };
+    return this.flushQueuedEvents("manual");
   }
 
   /** Run a pipe DSL query. Returns Markdown (default), JSON, or CSV. */
@@ -353,6 +395,10 @@ export class WireLog {
     this._sessionId = null;
     this._lastActivity = 0;
     this._attrIdentified = null;
+    this._queue = [];
+    this.clearFlushTimer();
+    this.clearRetryTimer();
+    this._retryCount = 0;
 
     // Match wirelog.js reset behavior: new device, clear stored user.
     lsSet("wl_did", "");
@@ -363,6 +409,163 @@ export class WireLog {
 
     this._deviceId = hexId();
     lsSet("wl_did", this._deviceId);
+  }
+
+  private ensureInitialized(): boolean {
+    if (this._initialized) return true;
+    console.warn("wirelog: call wl.init({ apiKey }) before tracking events");
+    return false;
+  }
+
+  private enqueueBrowserEvents(events: TrackEvent[]): void {
+    for (const event of events) {
+      if (this._queue.length >= QUEUE_MAX) {
+        this._queue.shift();
+      }
+      this._queue.push(event);
+    }
+  }
+
+  private scheduleFlush(): void {
+    if (this._flushTimer || !this._queue.length) return;
+    this._flushTimer = setTimeout(() => {
+      this._flushTimer = null;
+      void this.flushQueuedEvents("interval");
+    }, BATCH_INTERVAL);
+  }
+
+  private clearFlushTimer(): void {
+    if (!this._flushTimer) return;
+    clearTimeout(this._flushTimer);
+    this._flushTimer = null;
+  }
+
+  private clearRetryTimer(): void {
+    if (!this._retryTimer) return;
+    clearTimeout(this._retryTimer);
+    this._retryTimer = null;
+  }
+
+  private scheduleRetry(): void {
+    if (this._retryTimer || !this._queue.length) return;
+    const delay = Math.min(30000, RETRY_BASE_MS * Math.pow(2, this._retryCount));
+    this._retryTimer = setTimeout(() => {
+      this._retryTimer = null;
+      void this.flushQueuedEvents("retry");
+    }, delay + Math.floor(Math.random() * 250));
+  }
+
+  private installBrowserFlushHooks(): void {
+    if (!isBrowserEnv() || this._browserHooksInstalled) return;
+    this._browserHooksInstalled = true;
+
+    if (typeof window.addEventListener === "function") {
+      window.addEventListener("pagehide", () => {
+        void this.flushQueuedEvents("pagehide");
+      });
+    }
+
+    if (typeof document.addEventListener === "function") {
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") {
+          void this.flushQueuedEvents("hidden");
+        }
+      });
+    }
+  }
+
+  private flushQueuedEvents(reason: FlushReason): Promise<TrackResult> {
+    if (!isBrowserEnv() || !this._queue.length) return Promise.resolve({ accepted: 0 });
+    if (!this.ensureInitialized()) return Promise.resolve({ accepted: 0, buffered: true });
+    if (this._flushPromise) return this._flushPromise;
+
+    this._flushPromise = this.drainQueuedEvents(reason).finally(() => {
+      this._flushPromise = null;
+      if (this._queue.length && !this._retryTimer) this.scheduleFlush();
+    });
+    return this._flushPromise;
+  }
+
+  private async drainQueuedEvents(reason: FlushReason): Promise<TrackResult> {
+    if (!this._queue.length) return { accepted: 0 };
+
+    this.clearFlushTimer();
+    this.clearRetryTimer();
+
+    let totalAccepted = 0;
+    let sendReason = reason;
+    while (this._queue.length) {
+      const batch = this._queue.splice(0, Math.min(BATCH_MAX, this._queue.length));
+      const outcome = await this.sendTrackBatch(batch, sendReason);
+
+      if (outcome.ok) {
+        totalAccepted += outcome.accepted;
+        this._retryCount = 0;
+        sendReason = "batch";
+        continue;
+      }
+
+      if (!outcome.retryable) {
+        this._retryCount = 0;
+        continue;
+      }
+
+      // Put failed batch back at the front and retry with backoff.
+      this._queue = batch.concat(this._queue);
+      this._retryCount++;
+      if (this._retryCount > RETRY_MAX) {
+        this._queue.splice(0, batch.length);
+        this._retryCount = 0;
+        continue;
+      }
+      this.scheduleRetry();
+      break;
+    }
+
+    return { accepted: totalAccepted };
+  }
+
+  private async sendTrackBatch(
+    events: TrackEvent[],
+    reason: FlushReason,
+  ): Promise<{ ok: boolean; retryable: boolean; accepted: number }> {
+    try {
+      const result = await this.post(
+        "/track",
+        { events, clientOriginated: true },
+        { keepalive: reason === "hidden" || reason === "pagehide" },
+      );
+      return {
+        ok: true,
+        retryable: false,
+        accepted: this.acceptedFromTrackResponse(result, events.length),
+      };
+    } catch (err) {
+      if (err instanceof WireLogError) {
+        return {
+          ok: false,
+          retryable: this.isRetryableStatus(err.status),
+          accepted: 0,
+        };
+      }
+      return {
+        ok: false,
+        retryable: true,
+        accepted: 0,
+      };
+    }
+  }
+
+  private isRetryableStatus(status: number): boolean {
+    return status === 429 || (status >= 500 && status < 600) || status === 0;
+  }
+
+  private acceptedFromTrackResponse(result: unknown, fallback: number): number {
+    if (result && typeof result === "object" && "accepted" in result) {
+      const accepted = (result as { accepted?: unknown }).accepted;
+      if (typeof accepted === "number" && Number.isFinite(accepted)) return accepted;
+    }
+    return fallback;
   }
 
   private enrichEvent(event: TrackEvent): TrackEvent {
@@ -449,7 +652,11 @@ export class WireLog {
     return { first, last };
   }
 
-  private async post(path: string, body: unknown): Promise<unknown> {
+  private async post(
+    path: string,
+    body: unknown,
+    opts?: { keepalive?: boolean },
+  ): Promise<unknown> {
     if (!this._initialized) {
       console.warn("wirelog: call wl.init({ apiKey }) before tracking events");
       return {};
@@ -462,6 +669,7 @@ export class WireLog {
         "X-API-Key": this.apiKey,
       },
       body: JSON.stringify(body),
+      keepalive: opts?.keepalive ?? false,
     });
 
     if (!resp.ok) {

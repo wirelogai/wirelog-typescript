@@ -2,7 +2,7 @@
  * Tests for the WireLog client. Uses node:test (no external deps).
  */
 
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { WireLog } from "./client.js";
@@ -15,6 +15,7 @@ interface MockRequest {
 }
 
 let lastRequest: MockRequest | null = null;
+let requestCount = 0;
 let mockResponse = { body: "{}", status: 200, contentType: "application/json" };
 
 const server = http.createServer((req, res) => {
@@ -22,6 +23,7 @@ const server = http.createServer((req, res) => {
   req.on("data", (chunk: Buffer) => chunks.push(chunk));
   req.on("end", () => {
     const bodyStr = Buffer.concat(chunks).toString();
+    requestCount++;
     lastRequest = {
       path: req.url ?? "",
       method: req.method ?? "",
@@ -55,6 +57,11 @@ before(async () => {
 
 after(() => {
   server.close();
+});
+
+beforeEach(() => {
+  lastRequest = null;
+  requestCount = 0;
 });
 
 function client(): WireLog {
@@ -222,7 +229,7 @@ describe("WireLog client", () => {
     });
   });
 
-  it("browser track injects auto-context and caller props override defaults", async () => {
+  it("browser track buffers by default and flush sends batched payload", async () => {
     mockResponse = {
       body: JSON.stringify({ accepted: 1 }),
       status: 200,
@@ -231,21 +238,33 @@ describe("WireLog client", () => {
 
     await withBrowserEnv("https://app.example.com/home", async () => {
       const browserClient = new WireLog({ apiKey: "sk_test_key", host: baseUrl });
-      await browserClient.track({
+      const buffered = await browserClient.track({
         event_type: "cta_clicked",
         event_properties: {
           url: "https://override.example.com/path",
           language: "fr-FR",
         },
       });
+      assert.equal(buffered.accepted, 1);
+      assert.equal(buffered.buffered, true);
+      assert.equal(requestCount, 0);
+
+      const flushed = await browserClient.flush();
+      assert.equal(flushed.accepted, 1);
     });
 
-    const props = lastRequest?.body.event_properties as Record<string, unknown>;
+    assert.equal(requestCount, 1);
+    assert.equal(lastRequest?.path, "/track");
+    assert.equal(lastRequest?.body.clientOriginated, true);
+    const events = lastRequest?.body.events as Array<Record<string, unknown>>;
+    assert.equal(events.length, 1);
+
+    const props = events[0].event_properties as Record<string, unknown>;
     assert.equal(props.url, "https://override.example.com/path");
     assert.equal(props.language, "fr-FR");
-    assert.ok(lastRequest?.body.session_id);
-    assert.ok(lastRequest?.body.device_id);
-    assert.equal(lastRequest?.body.clientOriginated, true);
+    assert.ok(events[0].session_id);
+    assert.ok(events[0].device_id);
+    assert.equal(events[0].clientOriginated, true);
   });
 
   it("browser trackBatch marks request as client-originated", async () => {
