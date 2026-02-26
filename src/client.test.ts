@@ -285,6 +285,138 @@ describe("WireLog client", () => {
     assert.equal(events[1].clientOriginated, true);
   });
 
+  it("hydrates session from sessionStorage (shared with wirelog.js)", async () => {
+    mockResponse = {
+      body: JSON.stringify({ accepted: 1 }),
+      status: 200,
+      contentType: "application/json",
+    };
+
+    await withBrowserEnv("https://app.example.com/home", async ({ sessionStorage }) => {
+      // Simulate wirelog.js having already created a session.
+      const wirelogSessionId = "aabbccddeeff001122334455";
+      const wirelogLastActivity = String(Date.now() - 5000); // 5s ago, well within timeout
+      sessionStorage.setItem("wl_sid", wirelogSessionId);
+      sessionStorage.setItem("wl_slast", wirelogLastActivity);
+
+      const browserClient = new WireLog({ apiKey: "sk_test_key", host: baseUrl });
+      await browserClient.track({ event_type: "click" });
+      await browserClient.flush();
+    });
+
+    const events = lastRequest?.body.events as Array<Record<string, unknown>>;
+    assert.equal(events[0].session_id, "aabbccddeeff001122334455");
+  });
+
+  it("persists new session to sessionStorage so wirelog.js can find it", async () => {
+    mockResponse = {
+      body: JSON.stringify({ accepted: 1 }),
+      status: 200,
+      contentType: "application/json",
+    };
+
+    await withBrowserEnv("https://app.example.com/home", async ({ sessionStorage }) => {
+      // No pre-existing session — TypeScript SDK should create one and persist.
+      const browserClient = new WireLog({ apiKey: "sk_test_key", host: baseUrl });
+      await browserClient.track({ event_type: "click" });
+      await browserClient.flush();
+
+      const storedSid = sessionStorage.getItem("wl_sid");
+      const storedLast = sessionStorage.getItem("wl_slast");
+      assert.ok(storedSid, "session ID should be persisted to sessionStorage");
+      assert.ok(storedLast, "last activity should be persisted to sessionStorage");
+      assert.equal(storedSid!.length, 24, "session ID should be 24-char hex");
+    });
+  });
+
+  it("rotates session after timeout and persists the new one", async () => {
+    mockResponse = {
+      body: JSON.stringify({ accepted: 1 }),
+      status: 200,
+      contentType: "application/json",
+    };
+
+    await withBrowserEnv("https://app.example.com/home", async ({ sessionStorage }) => {
+      // Simulate an expired session (31 minutes ago).
+      const expiredSessionId = "deadbeefdeadbeefdeadbeef";
+      const expiredLast = String(Date.now() - 31 * 60 * 1000);
+      sessionStorage.setItem("wl_sid", expiredSessionId);
+      sessionStorage.setItem("wl_slast", expiredLast);
+
+      const browserClient = new WireLog({ apiKey: "sk_test_key", host: baseUrl });
+      await browserClient.track({ event_type: "click" });
+      await browserClient.flush();
+
+      // Session should have been rotated.
+      const newSid = sessionStorage.getItem("wl_sid");
+      assert.ok(newSid);
+      assert.notEqual(newSid, expiredSessionId, "expired session should be rotated");
+    });
+  });
+
+  it("shares device ID with wirelog.js via localStorage", async () => {
+    mockResponse = {
+      body: JSON.stringify({ accepted: 1 }),
+      status: 200,
+      contentType: "application/json",
+    };
+
+    await withBrowserEnv("https://app.example.com/home", async ({ localStorage }) => {
+      // Simulate wirelog.js having already created a device ID.
+      localStorage.setItem("wl_did", "wirelog_device_aabbccdd1122");
+
+      const browserClient = new WireLog({ apiKey: "sk_test_key", host: baseUrl });
+      assert.equal(browserClient.deviceId, "wirelog_device_aabbccdd1122");
+
+      await browserClient.track({ event_type: "click" });
+      await browserClient.flush();
+    });
+
+    const events = lastRequest?.body.events as Array<Record<string, unknown>>;
+    assert.equal(events[0].device_id, "wirelog_device_aabbccdd1122");
+  });
+
+  it("picks up device ID changes from wirelog.js reset on next track", async () => {
+    mockResponse = {
+      body: JSON.stringify({ accepted: 1 }),
+      status: 200,
+      contentType: "application/json",
+    };
+
+    await withBrowserEnv("https://app.example.com/home", async ({ localStorage }) => {
+      localStorage.setItem("wl_did", "original_device_id_aabbcc");
+
+      const browserClient = new WireLog({ apiKey: "sk_test_key", host: baseUrl });
+      assert.equal(browserClient.deviceId, "original_device_id_aabbcc");
+
+      // Simulate wirelog.js calling reset() — removes old, writes new.
+      localStorage.removeItem("wl_did");
+      localStorage.setItem("wl_did", "new_device_after_reset_dd");
+
+      await browserClient.track({ event_type: "click" });
+      await browserClient.flush();
+    });
+
+    const events = lastRequest?.body.events as Array<Record<string, unknown>>;
+    assert.equal(events[0].device_id, "new_device_after_reset_dd");
+  });
+
+  it("reset clears session from sessionStorage", async () => {
+    await withBrowserEnv("https://app.example.com/home", async ({ sessionStorage, localStorage }) => {
+      sessionStorage.setItem("wl_sid", "session_to_clear_aabbcc");
+      sessionStorage.setItem("wl_slast", String(Date.now()));
+
+      const browserClient = new WireLog({ apiKey: "sk_test_key", host: baseUrl });
+      browserClient.reset();
+
+      assert.equal(sessionStorage.getItem("wl_sid"), null, "session ID should be removed");
+      assert.equal(sessionStorage.getItem("wl_slast"), null, "last activity should be removed");
+      assert.equal(localStorage.getItem("wl_uid"), null, "user ID should be removed");
+      // Device ID should be regenerated.
+      assert.ok(localStorage.getItem("wl_did"), "device ID should be regenerated");
+    });
+  });
+
   it("identify merges attribution and dedupes only after successful response", async () => {
     await withBrowserEnv("https://app.example.com/?utm_source=google&utm_campaign=spring", async () => {
       const browserClient = new WireLog({ apiKey: "sk_test_key", host: baseUrl });

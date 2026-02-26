@@ -32,6 +32,8 @@ const ATTR_PARAMS = [
   "fbclid",
 ] as const;
 
+const SESSION_ID_KEY = "wl_sid";
+const SESSION_LAST_KEY = "wl_slast";
 const ATTR_FIRST_KEY = "wl_attr_first";
 const ATTR_LAST_KEY = "wl_attr_last";
 const ATTR_SYNC_USER_KEY = "wl_attr_sync_user";
@@ -76,6 +78,15 @@ function lsSet(key: "wl_did" | "wl_uid", value: string): void {
     localStorage.setItem(key, value);
   } catch {
     /* storage full or blocked — best-effort */
+  }
+}
+
+function lsRemove(key: "wl_did" | "wl_uid"): void {
+  if (!isBrowserEnv()) return;
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    /* best-effort */
   }
 }
 
@@ -259,8 +270,8 @@ export class WireLog {
         lsSet("wl_did", this._deviceId);
       }
       this._userId = lsGet("wl_uid") || null;
-      this._sessionId = hexId();
-      this._lastActivity = Date.now();
+      // Session is hydrated lazily from sessionStorage in browserIdentity(),
+      // so we always share the same session as wirelog.js.
       this._attrIdentified = ssGet(ATTR_SYNC_USER_KEY) || null;
 
       // Keep attribution pending state up to date even before identify.
@@ -350,6 +361,10 @@ export class WireLog {
     let shouldMarkAttrSynced = false;
 
     if (isBrowserEnv()) {
+      // Re-read device ID from localStorage in case wirelog.js changed it.
+      const storedDid = lsGet("wl_did");
+      if (storedDid) this._deviceId = storedDid;
+
       this._userId = userID;
       lsSet("wl_uid", userID);
 
@@ -400,9 +415,12 @@ export class WireLog {
     this.clearRetryTimer();
     this._retryCount = 0;
 
-    // Match wirelog.js reset behavior: new device, clear stored user.
-    lsSet("wl_did", "");
-    lsSet("wl_uid", "");
+    // Match wirelog.js reset: removeItem (not set-empty) for localStorage,
+    // clear all session state from sessionStorage.
+    lsRemove("wl_did");
+    lsRemove("wl_uid");
+    ssRemove(SESSION_ID_KEY);
+    ssRemove(SESSION_LAST_KEY);
     ssRemove(ATTR_SYNC_USER_KEY);
     ssRemove(ATTR_FIRST_KEY);
     ssRemove(ATTR_LAST_KEY);
@@ -585,18 +603,46 @@ export class WireLog {
   /**
    * Returns identity fields to merge into events when running in a browser.
    * In Node this returns an empty object so explicit caller values are used as-is.
+   *
+   * Session and device state are always re-read from web storage so that
+   * this client and wirelog.js (the script-tag SDK) stay in lock-step even
+   * when one side calls reset() or rotates the session.
    */
   private browserIdentity(): Partial<TrackEvent> {
     if (!isBrowserEnv()) return {};
 
     this.captureAttribution();
 
-    // Session rotation on inactivity, matching wirelog.js SESSION_TIMEOUT.
+    // Re-read device ID from localStorage in case wirelog.js changed it
+    // (e.g. via reset). If storage is empty and we have no in-memory
+    // value, generate one and persist so wirelog.js can find it.
+    const storedDid = lsGet("wl_did");
+    if (storedDid) {
+      this._deviceId = storedDid;
+    } else if (!this._deviceId) {
+      this._deviceId = hexId();
+      lsSet("wl_did", this._deviceId);
+    }
+
+    // Session management: hydrate from sessionStorage (shared with
+    // wirelog.js), rotate on timeout, persist back.  Mirrors the
+    // hydrateSession → getSessionId → persistSession flow in wirelog.js.
     const now = Date.now();
-    if (!this._sessionId || now - this._lastActivity > SESSION_TIMEOUT) {
+    if (!this._sessionId) {
+      const storedSid = ssGet(SESSION_ID_KEY);
+      const rawLast = ssGet(SESSION_LAST_KEY);
+      const storedLast = rawLast ? parseInt(rawLast, 10) : 0;
+      if (storedSid && storedLast && !isNaN(storedLast) && (now - storedLast) <= SESSION_TIMEOUT) {
+        this._sessionId = storedSid;
+        this._lastActivity = storedLast;
+      }
+    }
+    if (!this._sessionId || !this._lastActivity || (now - this._lastActivity) > SESSION_TIMEOUT) {
       this._sessionId = hexId();
     }
     this._lastActivity = now;
+    ssSet(SESSION_ID_KEY, this._sessionId);
+    ssSet(SESSION_LAST_KEY, String(this._lastActivity));
 
     // Re-read userId from localStorage in case wirelog.js updated it.
     const storedUid = lsGet("wl_uid");
