@@ -88,6 +88,15 @@ Flush buffered browser `track()` events immediately.
 
 Run a pipe DSL query. Options: `format` (`"llm"`, `"json"`, `"csv"`), `limit`, `offset`.
 
+```typescript
+// Discover event types and their properties
+const overview = await wl.query("inspect * | last 30d", { format: "json" });
+const details = await wl.query("inspect signup | last 7d", { format: "json" });
+
+// Discover available fields
+const fields = await wl.query("fields | last 7d", { format: "json" });
+```
+
 ### `wl.identify(params)`
 
 Bind a device to a user and/or set profile properties. Supports `user_property_ops` (`$set`, `$set_once`, `$add`, `$unset`). In browsers, persists `user_id` to localStorage.
