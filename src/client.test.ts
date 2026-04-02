@@ -132,27 +132,38 @@ async function withBrowserEnv(
 }
 
 describe("WireLog client", () => {
-  it("track sends event and returns accepted count", async () => {
+  it("node track buffers and flush sends batched payload", async () => {
     mockResponse = {
       body: JSON.stringify({ accepted: 1 }),
       status: 200,
       contentType: "application/json",
     };
-    const result = await client().track({
+    const wl = client();
+    const result = await wl.track({
       event_type: "signup",
       user_id: "u_123",
       event_properties: { plan: "free" },
     });
     assert.equal(result.accepted, 1);
+    assert.equal(result.buffered, true);
+    assert.equal(requestCount, 0, "track should buffer, not send immediately");
+
+    await wl.flush();
+
+    assert.equal(requestCount, 1);
     assert.equal(lastRequest?.path, "/track");
-    assert.equal(lastRequest?.body.event_type, "signup");
-    assert.equal(lastRequest?.body.user_id, "u_123");
-    assert.equal(lastRequest?.body.clientOriginated, undefined);
-    assert.ok(lastRequest?.body.insert_id);
-    assert.ok(lastRequest?.body.time);
+    const events = lastRequest?.body.events as Array<Record<string, unknown>>;
+    assert.equal(events.length, 1);
+    assert.equal(events[0].event_type, "signup");
+    assert.equal(events[0].user_id, "u_123");
+    assert.ok(events[0].insert_id);
+    assert.ok(events[0].time);
+    assert.equal(events[0].clientOriginated, undefined, "Node events should not be client-originated");
+
+    await wl.close();
   });
 
-  it("trackBatch sends batch", async () => {
+  it("trackBatch sends immediately", async () => {
     mockResponse = {
       body: JSON.stringify({ accepted: 2 }),
       status: 200,
@@ -164,6 +175,54 @@ describe("WireLog client", () => {
     ]);
     assert.equal(result.accepted, 2);
     assert.ok(Array.isArray(lastRequest?.body.events));
+  });
+
+  it("close flushes remaining events", async () => {
+    mockResponse = {
+      body: JSON.stringify({ accepted: 3 }),
+      status: 200,
+      contentType: "application/json",
+    };
+    const wl = client();
+    await wl.track({ event_type: "a" });
+    await wl.track({ event_type: "b" });
+    await wl.track({ event_type: "c" });
+    assert.equal(requestCount, 0);
+
+    await wl.close();
+
+    assert.ok(requestCount >= 1, "close should flush events");
+    const events = lastRequest?.body.events as Array<Record<string, unknown>>;
+    assert.ok(events.length > 0);
+  });
+
+  it("track after close is no-op", async () => {
+    mockResponse = {
+      body: JSON.stringify({ accepted: 1 }),
+      status: 200,
+      contentType: "application/json",
+    };
+    const wl = client();
+    await wl.close();
+
+    const result = await wl.track({ event_type: "test" });
+    assert.equal(result.accepted, 0);
+    assert.equal(requestCount, 0);
+  });
+
+  it("close is idempotent", async () => {
+    const wl = client();
+    await wl.close();
+    await wl.close();
+    // Should not throw
+  });
+
+  it("disabled client is no-op", async () => {
+    const wl = new WireLog({ apiKey: "sk_test", host: baseUrl, disabled: true });
+    const result = await wl.track({ event_type: "test" });
+    assert.equal(result.accepted, 0);
+    assert.equal(requestCount, 0);
+    await wl.close();
   });
 
   it("query sends DSL and returns result", async () => {
@@ -201,8 +260,11 @@ describe("WireLog client", () => {
       status: 200,
       contentType: "application/json",
     };
-    await client().track({ event_type: "test" });
+    const wl = client();
+    await wl.track({ event_type: "test" });
+    await wl.flush();
     assert.equal(lastRequest?.headers["x-api-key"], "sk_test_key");
+    await wl.close();
   });
 
   it("defaults host to api.wirelog.ai", () => {
@@ -449,5 +511,23 @@ describe("WireLog client", () => {
       assert.equal((thirdOps.$set_once as Record<string, unknown> | undefined)?.initial_utm_source, undefined);
       assert.equal((thirdOps.$set as Record<string, unknown> | undefined)?.last_utm_source, undefined);
     });
+  });
+
+  it("onError callback receives flush errors in Node", async () => {
+    const errors: Error[] = [];
+    mockResponse = { body: "bad", status: 400, contentType: "text/plain" };
+
+    const wl = new WireLog({
+      apiKey: "sk_test_key",
+      host: baseUrl,
+      onError: (err) => errors.push(err),
+    });
+
+    await wl.track({ event_type: "test" });
+    await wl.flush();
+
+    assert.ok(errors.length > 0, "onError should be called on flush failure");
+    assert.ok(errors[0].message.includes("400"));
+    await wl.close();
   });
 });

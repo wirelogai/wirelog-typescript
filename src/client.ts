@@ -5,6 +5,10 @@
  * In browsers, automatically piggybacks on the wirelog.js script tag's
  * localStorage identity (device_id, user_id), manages session_id, and
  * buffers `track()` events with async batch flushes.
+ *
+ * In Node.js, `track()` now also buffers events by default and flushes
+ * them in batches (matching browser behavior). Call `close()` to flush
+ * remaining events on shutdown.
  */
 
 // ---------------------------------------------------------------------------
@@ -177,11 +181,27 @@ function applyAttributionProps(
   }
 }
 
+function envVar(name: string): string | undefined {
+  if (isBrowserEnv()) return undefined;
+  try {
+    return typeof process !== "undefined" ? process.env?.[name] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface WireLogConfig {
-  /** API key (pk_, sk_, or aat_). */
+  /** API key (pk_, sk_, or aat_). Falls back to WIRELOG_API_KEY env var in Node. */
   apiKey?: string;
-  /** API base URL. Defaults to https://api.wirelog.ai. */
+  /** API base URL. Falls back to WIRELOG_HOST env var in Node. Defaults to https://api.wirelog.ai. */
   host?: string;
+  /**
+   * Error callback for background flush errors (Node.js only).
+   * In browsers, errors are handled internally with retry logic.
+   */
+  onError?: (err: Error) => void;
+  /** Disable all tracking. track() becomes a no-op. Useful for tests. */
+  disabled?: boolean;
 }
 
 export interface TrackEvent {
@@ -198,7 +218,7 @@ export interface TrackEvent {
 
 export interface TrackResult {
   accepted: number;
-  /** True when events were queued locally in the browser (not yet acknowledged by the API). */
+  /** True when events were queued locally (not yet acknowledged by the API). */
   buffered?: boolean;
 }
 
@@ -224,7 +244,7 @@ export interface QueryOptions {
   offset?: number;
 }
 
-type FlushReason = "manual" | "batch" | "interval" | "retry" | "hidden" | "pagehide";
+type FlushReason = "manual" | "batch" | "interval" | "retry" | "hidden" | "pagehide" | "close";
 
 /** Error thrown when the WireLog API returns a non-2xx response. */
 export class WireLogError extends Error {
@@ -241,6 +261,8 @@ export class WireLog {
   private apiKey: string;
   private host: string;
   private _initialized = false;
+  private _disabled: boolean;
+  private _onError: ((err: Error) => void) | undefined;
 
   // Browser identity state — populated only when running in a browser.
   private _deviceId: string | null = null;
@@ -256,10 +278,13 @@ export class WireLog {
   private _retryCount = 0;
   private _flushPromise: Promise<TrackResult> | null = null;
   private _browserHooksInstalled = false;
+  private _closed = false;
 
   constructor(config: WireLogConfig = {}) {
-    this.apiKey = config.apiKey ?? "";
-    this.host = (config.host ?? "https://api.wirelog.ai").replace(/\/$/, "");
+    this.apiKey = config.apiKey ?? envVar("WIRELOG_API_KEY") ?? "";
+    this.host = (config.host ?? envVar("WIRELOG_HOST") ?? "https://api.wirelog.ai").replace(/\/$/, "");
+    this._disabled = config.disabled ?? false;
+    this._onError = config.onError;
     if (this.apiKey) this._initialized = true;
 
     if (isBrowserEnv()) {
@@ -294,15 +319,19 @@ export class WireLog {
   init(config: WireLogConfig): void {
     if (config.apiKey) this.apiKey = config.apiKey;
     if (config.host) this.host = config.host.replace(/\/$/, "");
+    if (config.onError) this._onError = config.onError;
+    if (config.disabled !== undefined) this._disabled = config.disabled;
     this._initialized = true;
   }
 
-  /** Track a single event. In browsers, this is buffered and flushed in async batches. */
+  /**
+   * Track a single event. Buffered in both browsers and Node.js.
+   * Returns `{ accepted: 1, buffered: true }` immediately without waiting for the network.
+   */
   async track(event: TrackEvent): Promise<TrackResult> {
+    if (this._disabled || this._closed) return { accepted: 0 };
+
     const body = this.enrichEvent(event);
-    if (!isBrowserEnv()) {
-      return this.post("/track", body) as Promise<TrackResult>;
-    }
     if (!this.ensureInitialized()) {
       return { accepted: 0, buffered: true };
     }
@@ -318,7 +347,7 @@ export class WireLog {
 
   /**
    * Track multiple events in one request (up to 2000).
-   * In browsers, this sends immediately (explicit batch) and auto-injects identity/context per event.
+   * Always sends immediately (explicit batch) and auto-injects identity/context per event.
    */
   async trackBatch(events: TrackEvent[]): Promise<TrackResult> {
     const enriched = events.map((e) => this.enrichEvent(e));
@@ -327,13 +356,27 @@ export class WireLog {
   }
 
   /**
-   * Flush buffered browser events immediately.
-   * In Node this is a no-op and returns `{ accepted: 0 }`.
+   * Flush buffered events immediately.
+   * Blocks until the current queue is drained.
    */
   async flush(): Promise<TrackResult> {
-    if (!isBrowserEnv()) return { accepted: 0 };
+    if (this._disabled) return { accepted: 0 };
     if (!this.ensureInitialized()) return { accepted: 0, buffered: true };
     return this.flushQueuedEvents("manual");
+  }
+
+  /**
+   * Flush remaining events and stop the client.
+   * After close(), track() calls are silently dropped.
+   * Idempotent — safe to call multiple times.
+   */
+  async close(): Promise<TrackResult> {
+    if (this._closed || this._disabled) return { accepted: 0 };
+    this._closed = true;
+    this.clearFlushTimer();
+    this.clearRetryTimer();
+    if (!this._queue.length) return { accepted: 0 };
+    return this.flushQueuedEvents("close");
   }
 
   /** Run a pipe DSL query. Returns Markdown (default), JSON, or CSV. */
@@ -493,13 +536,13 @@ export class WireLog {
   }
 
   private flushQueuedEvents(reason: FlushReason): Promise<TrackResult> {
-    if (!isBrowserEnv() || !this._queue.length) return Promise.resolve({ accepted: 0 });
+    if (!this._queue.length) return Promise.resolve({ accepted: 0 });
     if (!this.ensureInitialized()) return Promise.resolve({ accepted: 0, buffered: true });
     if (this._flushPromise) return this._flushPromise;
 
     this._flushPromise = this.drainQueuedEvents(reason).finally(() => {
       this._flushPromise = null;
-      if (this._queue.length && !this._retryTimer) this.scheduleFlush();
+      if (this._queue.length && !this._retryTimer && !this._closed) this.scheduleFlush();
     });
     return this._flushPromise;
   }
@@ -548,10 +591,11 @@ export class WireLog {
     reason: FlushReason,
   ): Promise<{ ok: boolean; retryable: boolean; accepted: number }> {
     try {
+      const useKeepalive = reason === "hidden" || reason === "pagehide";
       const result = await this.post(
         "/track",
-        { events, clientOriginated: true },
-        { keepalive: reason === "hidden" || reason === "pagehide" },
+        isBrowserEnv() ? { events, clientOriginated: true } : { events },
+        { keepalive: isBrowserEnv() && useKeepalive },
       );
       return {
         ok: true,
@@ -560,12 +604,14 @@ export class WireLog {
       };
     } catch (err) {
       if (err instanceof WireLogError) {
+        if (!isBrowserEnv()) this.reportError(err);
         return {
           ok: false,
           retryable: this.isRetryableStatus(err.status),
           accepted: 0,
         };
       }
+      if (!isBrowserEnv()) this.reportError(err instanceof Error ? err : new Error(String(err)));
       return {
         ok: false,
         retryable: true,
@@ -584,6 +630,16 @@ export class WireLog {
       if (typeof accepted === "number" && Number.isFinite(accepted)) return accepted;
     }
     return fallback;
+  }
+
+  private reportError(err: Error): void {
+    if (this._onError) {
+      try {
+        this._onError(err);
+      } catch {
+        // never let error callback break the client
+      }
+    }
   }
 
   private enrichEvent(event: TrackEvent): TrackEvent {

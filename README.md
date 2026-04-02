@@ -15,7 +15,7 @@ import { wl } from "wirelog";
 
 wl.init({ apiKey: "pk_your_public_key" });
 
-// Track an event
+// Track an event (non-blocking, batched automatically)
 wl.track({ event_type: "signup", user_id: "u_123", event_properties: { plan: "free" } });
 
 // Identify a user (bind device → user, set profile)
@@ -23,93 +23,92 @@ wl.identify({ user_id: "alice@acme.org", user_properties: { plan: "pro" } });
 
 // All subsequent track() calls include user_id automatically
 wl.track({ event_type: "checkout", event_properties: { amount: 42 } });
+
+// Flush remaining events on shutdown (Node.js)
+await wl.close();
 ```
 
-In browsers, the singleton automatically manages `device_id`, `session_id`, and `user_id` — matching the same localStorage keys as the `wirelog.js` script tag (`wl_did`, `wl_uid`). If both SDKs are on the page, calling `identify()` from either one makes the user visible to both.
+## Design Principles
 
-Browser `track()` and `trackBatch()` auto-inject event context into `event_properties`:
-- `url`
-- `language`
-- `timezone`
+This client is designed to **never break your application**:
 
-Browser events are also marked with `clientOriginated: true` automatically.
+- **Non-blocking**: `track()` buffers events and returns immediately — no HTTP calls on the hot path
+- **Automatic batching**: Events are sent in batches (10 per batch or every 2 seconds) in both Node.js and browsers
+- **Bounded memory**: Queue capped at 500 events — oldest events are dropped when full
+- **Retry with backoff**: Transient failures (429, 5xx, network) are retried up to 3 times
+- **Graceful shutdown**: `close()` flushes remaining events (Node.js); page lifecycle hooks handle browsers
 
-Caller-provided `event_properties` win on key conflicts.
+## Node.js Buffering
 
-## Browser Delivery (Breaking Change)
-
-In browsers, `track()` now buffers events locally and flushes them asynchronously in small batches:
+`track()` buffers events in both Node.js and browsers:
 - Flushes on every 10 queued events or every 2 seconds
-- Retries transient failures (`429`, `5xx`, network) with backoff (up to 3 retries)
-- Flushes on `visibilitychange` (hidden) and `pagehide` using `fetch(..., { keepalive: true })`
+- Retries transient failures (429, 5xx, network) with exponential backoff (up to 3 retries)
 - Queue is capped at 500 events (oldest events are dropped first)
+- Call `close()` before process exit to flush remaining events
 
-`trackBatch()` is still explicit and sends immediately as one request (up to 2000 events).
+`trackBatch()` always sends immediately as one request (up to 2000 events).
 
-## Explicit Instances
+## Browser Delivery
 
-For server-side Node.js, multiple projects, or test isolation, create instances directly:
+In browsers, the same buffering applies with additional lifecycle hooks:
+- Flushes on `visibilitychange` (hidden) and `pagehide` using `fetch(..., { keepalive: true })`
+- Auto-manages `device_id`, `session_id`, and `user_id` via localStorage/sessionStorage
+- Shares identity with the `wirelog.js` script tag (`wl_did`, `wl_uid` keys)
+- Auto-injects `url`, `language`, `timezone` into `event_properties`
+- Auto-captures UTM attribution (`utm_*`, `gclid`, `fbclid`)
+
+## Configuration
 
 ```typescript
 import { WireLog } from "wirelog";
 
-const client = new WireLog({ apiKey: "sk_your_secret_key" });
+const client = new WireLog({
+  apiKey: "sk_...",         // Falls back to WIRELOG_API_KEY env var (Node.js)
+  host: "https://...",      // Falls back to WIRELOG_HOST env var (Node.js)
+  onError: (err) => {       // Background error callback (Node.js)
+    console.error(err);
+  },
+  disabled: false,          // true = track() is a no-op
+});
 
-await client.track({ event_type: "invoice.paid", user_id: "u_123" });
-const result = await client.query("invoice.paid | last 7d | count by day");
+// Use the client
+await client.track({ event_type: "test" });
+await client.close();
 ```
 
 ## API
 
 ### `wl.init(config)`
 
-Initialize the singleton with your API key. Call once at app startup. If you skip this, `track()`/`identify()`/`query()` will `console.warn` and no-op.
+Initialize the singleton with your API key. Call once at app startup.
 
 ### `wl.track(event)`
 
-Track a single event. Auto-generates `insert_id` and `time` if not provided.
-
-In browsers, `track()` is buffered by default: it enqueues the event and returns `{ accepted: 1, buffered: true }`.
-
-In Node, `track()` sends immediately and returns the API response.
+Track a single event. Buffered in both Node.js and browsers — returns `{ accepted: 1, buffered: true }` immediately.
 
 ### `wl.trackBatch(events)`
 
-Track multiple events in one request (up to 2000). In browsers, auto-injects identity and browser context per event, then sends immediately.
+Track multiple events in one request (up to 2000). Sends immediately.
 
 ### `wl.flush()`
 
-Flush buffered browser `track()` events immediately.
+Flush buffered events immediately. Blocks until the current queue is drained.
 
-- Browser: sends queued events now and returns `{ accepted: N }`
-- Node: no-op, returns `{ accepted: 0 }`
+### `wl.close()`
+
+Flush remaining events and stop the client. After `close()`, `track()` calls are silently dropped. Idempotent.
 
 ### `wl.query(q, opts?)`
 
 Run a pipe DSL query. Options: `format` (`"llm"`, `"json"`, `"csv"`), `limit`, `offset`.
 
-```typescript
-// Discover event types and their properties
-const overview = await wl.query("inspect * | last 30d", { format: "json" });
-const details = await wl.query("inspect signup | last 7d", { format: "json" });
-
-// Discover available fields
-const fields = await wl.query("fields | last 7d", { format: "json" });
-```
-
 ### `wl.identify(params)`
 
-Bind a device to a user and/or set profile properties. Supports `user_property_ops` (`$set`, `$set_once`, `$add`, `$unset`). In browsers, persists `user_id` to localStorage.
-
-`identify()` requires a non-empty `user_id`. In browser mode, pending URL attribution (`utm_*`, `gclid`, `fbclid`) is merged into one identify call:
-- first touch -> `$set_once.initial_*`
-- last touch -> `$set.last_*`
-
-Attribution dedupe is marked only after a successful identify response.
+Bind a device to a user and/or set profile properties. Supports `user_property_ops` (`$set`, `$set_once`, `$add`, `$unset`).
 
 ### `wl.reset()`
 
-Clear identity state. In browsers, generates a new device ID and clears the stored user. Matches the behavior of `window.wl.reset()`.
+Clear identity state (browser only). Generates a new device ID and clears the stored user.
 
 ### `wl.deviceId` / `wl.userId`
 
