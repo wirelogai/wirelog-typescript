@@ -2,6 +2,8 @@
 
 [WireLog](https://wirelog.ai) analytics client for Node.js and browsers. **Zero runtime dependencies** — uses native `fetch` and Web Crypto.
 
+> Headless alternative to PostHog, Amplitude, and Mixpanel — designed for agents instead of dashboards.
+
 ## Install
 
 ```bash
@@ -121,5 +123,6 @@ This library uses only the native `fetch` and Web Crypto APIs. No `axios`, no `n
 ## Learn More
 
 - [WireLog](https://wirelog.ai) — headless analytics for agents and LLMs
+- [Why WireLog vs PostHog/Amplitude](https://docs.wirelog.ai/guides/vs-posthog/) — comparison guide
 - [Query language docs](https://docs.wirelog.ai/query-language/overview/)
 - [API reference](https://docs.wirelog.ai/reference/api/)
